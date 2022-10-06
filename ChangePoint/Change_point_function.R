@@ -1,37 +1,3 @@
-library(readr)
-library(lubridate)
-library(TSA)
-library(rugarch)
-library(e1071)
-library(WeightSVM)
-require(dplyr)
-source("Change_point_function.R")
-
-# read data
-data_org <- read_csv("./../data/BDI.csv")
-colnames(data_org)<-c("Date","Value")
-data_org$Date=ymd(data_org$Date)
-
-
-# Extract the data which between 2003 to 2010
-data_org=data_org[which(data_org$Date>ymd(20030101)),]
-data_org=data_org[which(data_org$Date<ymd(20100101)),]
-data_org=data_org %>% arrange(Date) %>% filter(!(Date%in%ymd(20070101,20080101,20090101)))
-
-Sys.setlocale("LC_TIME", "C")
-date_range=range(data_org$Date)
-data=data.frame(Date=seq(date_range[1],date_range[2],1)) %>% filter(!weekdays(Date)%in%c("Saturday","Sunday")) %>% 
-  left_join(data_org)
-data$Value=imputeTS::na.interpolation(data$Value)
-
-# Calculate the log return
-data$return=c(NA,diff(log(data$Value)))
-data$RW=c(NA,(data$return[-nrow(data)]))
-data=data[-1,]
-
-# Partition data into train and test sets
-train=data[-which(data$Date>ymd(20060101)),]
-test=data[which(data$Date>ymd(20060101)),]
 
 # Function used in building SVR ARMA GARCH
 svr.arma.grach=function(
@@ -174,104 +140,95 @@ svr.arma.grach=function(
 }
 
 
-
-##############
-m=svr.arma.grach(
-  sequence=train$return,
-  arma.order = c(2,2),
-  epsilon_arma = 0.1,
-  cost_arma = 1,
-  fgamma_arma = 0.01,
-  garch.order = c(1,1),
-  epsilon_garch = 0.08,
-  cost_garch = 1,
-  fgamma_garch = 0.075,
-  stop_rate = 0.01
-)
-pre=predict.svr.arma.grach(newdata=test$return,model=m)
-
-
-######################
-data=data.frame(
-  date=test$Date,
-  true=pre$mean$sequence,
-  predict=pre$mean$sequence,
-  residuals=pre$mean$sequence-pre$mean$predict
-)
-###################
-data$date=ymd(data$date)
-data$CUSUM=0
-data$CUSUM_s=0
-for(i in 251:nrow(data)){
-  tmp=T_mean(true=data$true[1:i],
-             predict = data$predict[1:i],
-             residuals = data$residuals[1:i])
-  # Original CUMSUM
-  data$CUSUM[i]=as.numeric(sum(tmp$T_mean>1.358)>0)
-  L=length(tmp$T_mean)+1
-  true_sd=sqrt(sapply(c(1:L)/L, tmp_f))[-L]
-  UCL_d=3.48*true_sd
-  # CUMSUM using modified boundary 
-  l=as.integer(L*0.22)
-  UCL_h=c(rep(1.358,l),UCL_d[(l+1):(L-1)])
-  UCL_max_scale=2.413
-  data$CUSUM_s[i]=as.numeric(sum(tmp$T_mean>UCL_h)>0)
+#################################
+# Function used to predict by SVR ARMA GARCH model
+predict.svr.arma.grach=function(model,newdata){
+  all_sequence=c(model$arma_data$sequence,newdata)
+  tmp_data=data.frame(
+    sequence=all_sequence
+  )
+  tmp_ar=as.data.frame(matrix(NA,nrow(tmp_data),model$arma_order[1]))
+  for(i in 1:model$arma_order[1]){
+    tmp_ar[,i]=c(rep(NA,i),all_sequence[1:(length(all_sequence)-i)])
+  }
+  colnames(tmp_ar)=paste0("AR_",c(1:model$arma_order[1]))
+  tmp_data=cbind(tmp_data,tmp_ar)
+  tmp=as.data.frame(matrix(NA,length(newdata),model$arma_order[2]))
+  tmp2=as.data.frame(as.matrix(model$arma_data[,c((ncol(model$arma_data)-model$arma_order[2]+1):ncol(model$arma_data))]))
+  colnames(tmp)=colnames(tmp2)=paste0("MA_",c(1:model$arma_order[2]))
+  tmp_MA=rbind(tmp2,tmp)
+  
+  tmp_data=cbind(tmp_data,tmp_MA)
+  tmp_data$predict=c(model$arma_model$fitted,rep(NA,length(newdata)))
+  tmp_data$MA_0=tmp_data$sequence-tmp_data$predict
+  all_i=which(is.na(tmp_data$predict))
+  all_arma=which(is.na(tmp_data$predict))
+  for(i in all_i){
+    for(tmpi in 1:model$arma_order[2]){
+      tmp_data[i,model$arma_order[1]+1+tmpi]=tmp_data$MA_0[i-tmpi]
+    }
+    tmp_data$predict[i]=predict(model$arma_model,tmp_data[i,])
+    tmp_data$MA_0[i]=tmp_data$sequence[i]-tmp_data$predict[i]
+  }
+  garch_sequence=c(tmp_data$MA_0^2)
+  garch_data=data.frame(
+    sequence=garch_sequence
+  )
+  garch_ar=as.data.frame(matrix(NA,nrow(garch_data),model$garch_order[1]))
+  for(i in 1:model$garch_order[1]){
+    garch_ar[,i]=c(rep(NA,i),garch_sequence[1:(length(garch_sequence)-i)])
+  }
+  colnames(garch_ar)=paste0("AR_",c(1:model$garch_order[1]))
+  garch_data=cbind(garch_data,garch_ar)
+  tmp=as.data.frame(matrix(NA,length(newdata),model$garch_order[2]))
+  tmp2=as.matrix(model$garch_data[,c((ncol(model$garch_data)-model$garch_order[2]+1):ncol(model$garch_data))])
+  colnames(tmp2)=paste0("MA_",c(1:model$garch_order[2]))
+  colnames(tmp)=colnames(tmp2)
+  tmp_MA=rbind(tmp2,tmp)
+  nrow(garch_data)-nrow(tmp_MA)
+  tmp_MA=rbind(matrix(NA,nrow(garch_data)-nrow(tmp_MA),ncol(tmp_MA)),as.matrix(tmp_MA))
+  colnames(tmp_MA)=colnames(tmp)
+  garch_data=cbind(garch_data,tmp_MA)
+  garch_data$predict=c(model$garch_model$fitted,rep(NA,nrow(garch_data)-length(model$garch_model$fitted)))
+  garch_data$MA_0=garch_data$sequence-garch_data$predict
+  all_i=which(is.na(garch_data$predict))
+  i=all_i[1]
+  for(i in all_i){
+    for(tmpi in 1:model$garch_order[2]){
+      garch_data[i,model$garch_order[1]+1+tmpi]=garch_data$MA_0[i-tmpi]
+    }
+    garch_data$predict[i]=predict(model$garch_model,garch_data[i,])
+    garch_data$MA_0[i]=garch_data$sequence[i]-garch_data$predict[i]
+  }
+  output=list(mean=tmp_data[all_arma,],var=garch_data[all_arma,])
+  output
+  
 }
 
 
+tmp_f=function(x){x*(1-x)}
 
-require(ggplot2)
-require(gridExtra)
-require(grid)
-tmp_cumsum_s_date = data$date[data$CUSUM_s>=1] 
-test_cumsum2=test[test$Date%in%tmp_cumsum_s_date,]
-two_date = ymd(c(20070518,20080110))
-
-
-p1 <- ggplot()+
-  geom_line(test,mapping=aes(x=Date,y=return))+
-  geom_point(test_cumsum2,mapping=aes(x=Date,y=return),color="red")+
-  geom_vline(aes(xintercept = two_date),color="red",linetype ="dashed")+
-  geom_text(mapping=aes(x = two_date+days(60),y=rep(quantile(test$return,0.999),2),label=as.character(two_date)),color="red")+
-  xlab("Date")+
-  ylab("Return")+ 
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-        panel.background = element_blank(), axis.line = element_line(colour = "black"))
-
-p2 <- ggplot()+
-  geom_line(test,mapping=aes(x=Date,y=Value))+
-  geom_point(test_cumsum2,mapping=aes(x=Date,y=Value),color="red")+
-  geom_vline(aes(xintercept = two_date),color="red",linetype ="dashed")+
-  geom_text(mapping=aes(x = two_date+days(60),y=rep(quantile(test$Value,0.999),2),label=as.character(two_date)),color="red")+
-  xlab("Date")+
-  ylab("BDI Value")+ 
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-        panel.background = element_blank(), axis.line = element_line(colour = "black"))
-
-grid.arrange(p1,p2,
-             top = textGrob(expression("Times of detect change point by"~T[s]),
-                            gp=gpar(fontsize=20,font=1)))
-
-
-# Collect the first time when the test is rejected
-detech_time=lapply(data$date[data$CUSUM_s>=1], function(tmp_time){
-  i=which(data$date==tmp_time)
-  tmp=T_mean(true=data$true[1:i],
-             predict = data$predict[1:i],
-             residuals = data$residuals[1:i])
+T_mean=function(true=NA,predict=NA,residuals=NA,K=3.48){
+  if(length(true)==1){true=predict+residuals}
+  if(length(predict)==1){predict=true-residuals}
+  if(length(residuals)==1){residuals=true-predict}
+  tau1=sqrt(mean((predict^2)*(residuals^2)))
+  tmp1=mean(predict*residuals)
   
-  L=length(tmp$T_mean)+1
-  true_sd=sqrt(sapply(c(1:L)/L, tmp_f))[-L]
-  UCL_d=3.48*true_sd
-  l=as.integer(L*0.22)
-  UCL_h=c(rep(1.358,l),UCL_d[(l+1):(L-1)])
-  # 判斷改變點 位置
-  data$date[min(which(tmp$T_mean>UCL_h))]#"2007-08-09"
-  
-  
-})  %>% do.call(what="c") 
-
-# The first column of the following table shows the time when the change point is detected.
-# The second column of the following table shows the first time when the test is rejected
-data.frame(detech_time=data$date[data$CUSUM_s>=1],reject_time=detech_time)
-
+  n=length(true)
+  LS=function(K){
+    sqrt(((abs(sum(((predict)*(residuals))[1:K])-K*tmp1))^2)/(n*(tau1^2)))
+  }
+  tmp=(sapply(1:n,LS))
+  if(sum(is.na(tmp))==length(tmp)){
+    tmp=rep(0,length(tmp))
+  }
+  tmp_f=function(x){x*(1-x)}
+  true_sd=sqrt(sapply(c(1:length(tmp))/length(tmp), tmp_f))
+  output_CC=data.frame(
+    T_mean=tmp,
+    sd=true_sd,
+    UCL=K*true_sd
+  )
+  output_CC[-nrow(output_CC),]
+}
